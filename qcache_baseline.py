@@ -303,7 +303,7 @@ def main():
     prompt_txt = tokenizer.apply_chat_template([{"role": "user", "content": args.question}], add_generation_prompt=True, tokenize=False)
     prompt = torch.tensor(tokenizer(prompt_txt)["input_ids"], device=DEVICE).unsqueeze(0)
 
-    # benchmark(prompt, tokenizer, steps=args.steps, gen_len=args.gen, block_len=args.block, use_qcache=False)
+    benchmark(prompt, tokenizer, steps=args.steps, gen_len=args.gen, block_len=args.block, use_qcache=False)
     benchmark(prompt, tokenizer, steps=args.steps, gen_len=args.gen, block_len=args.block, use_qcache=True)
 
 if __name__ == "__main__":
