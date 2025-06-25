@@ -212,58 +212,36 @@ def find_blocks(model):
 #
 #     return step_reset
 
-def attach_qcache_once(model, total_seq_len, dtype=torch.bfloat16, device="cuda"):
-    blocks   = find_blocks(model)                      # 你的辅助函数
+def attach_qcache_once(model, seq_len, dtype=torch.bfloat16, device="cuda"):
+    blocks   = find_blocks(model)                       # 依旧沿用你的辅助函数
     n_layers = len(blocks)
     d_model  = model.config.hidden_size
 
-    # 缓存张量与有效位
-    q_mem = torch.empty(n_layers, total_seq_len, d_model,
-                        dtype=dtype, device=device)
-    valid = torch.zeros(n_layers, total_seq_len, dtype=torch.bool,
-                        device=device)
+    # 每层一次性缓存整条序列的 Query
+    q_mem   = torch.empty(n_layers, seq_len, d_model,
+                          dtype=dtype, device=device)
+    cached  = [False] * n_layers        # layer-level flag
 
-    # ------------ hook factory ------------------------------------
-    def make_hooks(lidx: int, fused: bool):
+    # ---------------- hook factory ---------------------------
+    def make_hooks(lidx: int):
+        # 若已缓存 → 直接返回缓存，Linear.forward 会被跳过
+        def pre_hook(mod, inp):
+            return (q_mem[lidx:lidx+1],) if cached[lidx] else None
 
-        # pre-hook：若整层已缓存 ➜ 直接返回缓存、跳过 GEMM
-        def pre_hook(module, inp):
-            if fused:
-                return None                     # att_proj 仍需照常执行
-            if valid[lidx].all():               # 全部命中
-                return (q_mem[lidx:lidx+1],)    # PyTorch 会用它当作输出
-            return None                         # 否则正常 forward
-
-        # post-hook：第一次 forward 时把 Q 写入缓存
-        def post_hook(module, inp, out):
-            if fused:
-                d = out.size(-1) // 3
-                q, kv = out[..., :d], out[..., d:]
-            else:
-                q = out
-
-            # 找出第一次出现的 token 行（valid == False）
-            miss = ~valid[lidx]
-            if miss.any():
-                q_mem[lidx, miss] = q.squeeze(0)[miss]
-                valid[lidx, miss] = True
-
-            # 把已缓存行替换为缓存，确保数值一致
-            q_final = torch.where(valid[lidx, :, None], q_mem[lidx], q)
-
-            return torch.cat([q_final, kv], -1) if fused else q_final
-
+        # 第一次 forward 时写入缓存；随后不会再触发
+        def post_hook(mod, inp, out):
+            if not cached[lidx]:
+                q_mem[lidx] = out.squeeze(0)   # (seq_len, d_model)
+                cached[lidx] = True
+            return out    # 不改动首次输出；后续步 pre_hook 已接管
         return pre_hook, post_hook
 
-    # ------------ 注册 hook 到所有层 -------------------------------
+    # 只需要处理分离的 q_proj
     for lidx, blk in enumerate(blocks):
-        if hasattr(blk, "q_proj"):              # Q/K/V 分离
-            pre, post = make_hooks(lidx, fused=False)
+        if hasattr(blk, "q_proj"):
+            pre, post = make_hooks(lidx)
             blk.q_proj.register_forward_pre_hook(pre)
             blk.q_proj.register_forward_hook(post)
-        elif hasattr(blk, "att_proj"):          # Q/K/V 融合
-            _, post = make_hooks(lidx, fused=True)
-            blk.att_proj.register_forward_hook(post)
 
 # ─────────────────────────────────── benchmark helper
 
