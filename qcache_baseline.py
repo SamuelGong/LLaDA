@@ -231,9 +231,13 @@ def attach_qcache_monkey(model, seq_len,
             # 若已缓存 ➜ 直接返回缓存张量，跳过 GEMM
             if cached[lidx]:
                 # 扩 batch 维以适配 (B, L, d); 这里默认 B==1
+                if lidx == 0:
+                    print(f"here {lidx}")
                 return q_mem[lidx:lidx+1].to(x.dtype)
 
             # 第一次调用 → 正常 GEMM
+            if lidx == 0:
+                print(f"there {lidx}")
             out = orig_fwd(x, *args, **kwargs)    # (1, L, d_q)
             q_mem[lidx] = out[0].to(dtype)        # 仅支持 batch==1
             cached[lidx] = True
