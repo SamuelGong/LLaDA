@@ -12,7 +12,7 @@ import argparse
 from contextlib import contextmanager
 import torch
 from transformers import AutoTokenizer, AutoModel
-from generate import add_gumbel_noise, get_num_transfer_tokens
+from generate import add_gumbel_noise, get_num_transfer_tokens, generate
 
 import numpy as np
 import torch.nn.functional as F
@@ -80,78 +80,78 @@ def cuda_timer(label="Elapsed"):
 #                 transfer[j, idx] = True
 #             x[transfer] = x0[transfer]
 #
-#             if step_callback is not None:
-#                 step_callback(b * s_per_block + t, (x == mask_id))
+            # if step_callback is not None:
+            #     step_callback(b * s_per_block + t, (x == mask_id))
 #     return x
 
-@ torch.no_grad()
-def generate_with_callback(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-             cfg_scale=0., remasking='low_confidence', mask_id=126336, step_callback=None):
-    '''
-    Args:
-        model: Mask predictor.
-        prompt: A tensor of shape (1, L).
-        steps: Sampling steps, less than or equal to gen_length.
-        gen_length: Generated answer length.
-        block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
-        temperature: Categorical distribution sampling temperature.
-        cfg_scale: Unsupervised classifier-free guidance scale.
-        remasking: Remasking strategy. 'low_confidence' or 'random'.
-        mask_id: The toke id of [MASK] is 126336.
-    '''
-    x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
-    x[:, :prompt.shape[1]] = prompt.clone()
-
-    prompt_index = (x != mask_id)
-
-    assert gen_length % block_length == 0
-    num_blocks = gen_length // block_length
-
-    assert steps % num_blocks == 0
-    steps = steps // num_blocks
-
-    for num_block in range(num_blocks):
-        block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
-        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
-        for i in range(steps):
-            mask_index = (x == mask_id)
-            if cfg_scale > 0.:
-                un_x = x.clone()
-                un_x[prompt_index] = mask_id
-                x_ = torch.cat([x, un_x], dim=0)
-                logits = model(x_).logits
-                logits, un_logits = torch.chunk(logits, 2, dim=0)
-                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-            else:
-                logits = model(x).logits
-
-            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-
-            if remasking == 'low_confidence':
-                p = F.softmax(logits, dim=-1)
-                x0_p = torch.squeeze(
-                    torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
-            elif remasking == 'random':
-                x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
-            else:
-                raise NotImplementedError(remasking)
-
-            x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
-
-            x0 = torch.where(mask_index, x0, x)
-            confidence = torch.where(mask_index, x0_p, -np.inf)
-
-            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-            for j in range(confidence.shape[0]):
-                _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
-                transfer_index[j, select_index] = True
-            x[transfer_index] = x0[transfer_index]
-
-            if step_callback is not None:
-                step_callback(num_block * steps + i, (x == mask_id))
-
-    return x
+# @ torch.no_grad()
+# def generate_with_callback(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
+#              cfg_scale=0., remasking='low_confidence', mask_id=126336, step_callback=None):
+#     '''
+#     Args:
+#         model: Mask predictor.
+#         prompt: A tensor of shape (1, L).
+#         steps: Sampling steps, less than or equal to gen_length.
+#         gen_length: Generated answer length.
+#         block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
+#         temperature: Categorical distribution sampling temperature.
+#         cfg_scale: Unsupervised classifier-free guidance scale.
+#         remasking: Remasking strategy. 'low_confidence' or 'random'.
+#         mask_id: The toke id of [MASK] is 126336.
+#     '''
+#     x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
+#     x[:, :prompt.shape[1]] = prompt.clone()
+#
+#     prompt_index = (x != mask_id)
+#
+#     assert gen_length % block_length == 0
+#     num_blocks = gen_length // block_length
+#
+#     assert steps % num_blocks == 0
+#     steps = steps // num_blocks
+#
+#     for num_block in range(num_blocks):
+#         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
+#         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+#         for i in range(steps):
+#             mask_index = (x == mask_id)
+#             if cfg_scale > 0.:
+#                 un_x = x.clone()
+#                 un_x[prompt_index] = mask_id
+#                 x_ = torch.cat([x, un_x], dim=0)
+#                 logits = model(x_).logits
+#                 logits, un_logits = torch.chunk(logits, 2, dim=0)
+#                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+#             else:
+#                 logits = model(x).logits
+#
+#             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+#             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+#
+#             if remasking == 'low_confidence':
+#                 p = F.softmax(logits, dim=-1)
+#                 x0_p = torch.squeeze(
+#                     torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+#             elif remasking == 'random':
+#                 x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+#             else:
+#                 raise NotImplementedError(remasking)
+#
+#             x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
+#
+#             x0 = torch.where(mask_index, x0, x)
+#             confidence = torch.where(mask_index, x0_p, -np.inf)
+#
+#             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+#             for j in range(confidence.shape[0]):
+#                 _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
+#                 transfer_index[j, select_index] = True
+#             x[transfer_index] = x0[transfer_index]
+#
+#             if step_callback is not None:
+#                 step_callback(num_block * steps + i, (x == mask_id))
+#
+#     return x
 
 # ─────────────────────────────── find transformer blocks
 
@@ -169,48 +169,112 @@ def find_blocks(model):
 
 # ───────────────────────────────── attach Q‑cache (unchanged from last version)
 
-def attach_qcache(model, total_seq_len):
-    blocks = find_blocks(model)
+# def attach_qcache(model, total_seq_len):
+#     blocks = find_blocks(model)
+#     n_layers = len(blocks)
+#     d_model = model.config.hidden_size
+#
+#     q_mem = torch.empty(n_layers, total_seq_len, d_model, dtype=DTYPE, device=DEVICE)
+#     valid = torch.zeros(n_layers, total_seq_len, dtype=torch.bool, device=DEVICE)
+#
+#     def make_hooks(lidx, fused):
+#         def pre_hook(module, input):
+#             if fused:
+#                 return None
+#             if valid[lidx].all():
+#                 return (q_mem[lidx:lidx + 1],)
+#             return None
+#
+#         def post_hook(module, input, output):
+#             if fused:
+#                 d = output.size(-1) // 3
+#                 q, kv = output[..., :d], output[..., d:]
+#             else:
+#                 q = output
+#             mixed_q = torch.where(valid[lidx, :, None], q_mem[lidx], q)
+#             q_mem[lidx] = torch.where(valid[lidx, :, None], q_mem[lidx], q)
+#             valid[lidx] |= True
+#             return torch.cat([mixed_q, kv], -1) if fused else mixed_q
+#         return pre_hook, post_hook
+#
+#     for lidx, blk in enumerate(blocks):
+#         if hasattr(blk, "q_proj"):
+#             pre, post = make_hooks(lidx, fused=False)
+#             blk.q_proj.register_forward_pre_hook(pre)
+#             blk.q_proj.register_forward_hook(post)
+#         elif hasattr(blk, "att_proj"):
+#             _, post = make_hooks(lidx, fused=True)
+#             blk.att_proj.register_forward_hook(post)
+#
+#     def step_reset(mask_tensor):
+#         decoded = (~mask_tensor.bool())[0]
+#         valid[:, decoded] = False
+#
+#     return step_reset
+
+def attach_qcache_once(model, total_seq_len,
+                       dtype=torch.bfloat16, device="cuda"):
+    blocks   = find_blocks(model)              # 已有的辅助函数
     n_layers = len(blocks)
-    d_model = model.config.hidden_size
+    d_model  = model.config.hidden_size
 
-    q_mem = torch.empty(n_layers, total_seq_len, d_model, dtype=DTYPE, device=DEVICE)
-    valid = torch.zeros(n_layers, total_seq_len, dtype=torch.bool, device=DEVICE)
+    # 缓存与标志
+    q_mem = torch.empty(n_layers, total_seq_len, d_model,
+                        dtype=dtype, device=device)
+    valid = torch.zeros(n_layers, total_seq_len, dtype=torch.bool,
+                        device=device)
 
-    def make_hooks(lidx, fused):
-        def pre_hook(module, input):
-            if fused:
+    # ---------------- hook factory --------------------------------
+    def make_hooks(lidx: int, fused: bool):
+        # ---------- 前置钩子：真正跳过或稀疏 GEMM ----------
+        def pre_hook(module, inp):
+            if fused:                 # att_proj 无法单独省 Q
                 return None
-            if valid[lidx].all():
-                return (q_mem[lidx:lidx + 1],)
-            return None
+            x_in, = inp               # (1, L, d)
 
-        def post_hook(module, input, output):
+            # 哪些行还没算过 Q ?
+            need_mask = ~valid[lidx]          # True → 第一次
+            if not need_mask.any():           # 全都算过 → 完全跳过 GEMM
+                return (q_mem[lidx:lidx+1],)
+
+            # 稀疏 GEMM：仅算 need_mask 行
+            out = q_mem[lidx].clone()         # 先拷贝缓存
+            need = x_in[:, need_mask]         # (1, U, d)
+            proj = F.linear(need, module.weight, module.bias)  # (1, U, d_q)
+            out[need_mask] = proj.squeeze(0).to(dtype)
+
+            # 更新缓存与 valid
+            q_mem[lidx, need_mask] = out[need_mask]
+            valid[lidx, need_mask] = True
+
+            return (out.unsqueeze(0),)        # 作为整层输出
+
+        # ---------- 后置钩子：仅处理融合投影 ----------
+        def post_hook(module, inp, out):
             if fused:
-                d = output.size(-1) // 3
-                q, kv = output[..., :d], output[..., d:]
-            else:
-                q = output
-            mixed_q = torch.where(valid[lidx, :, None], q_mem[lidx], q)
-            q_mem[lidx] = torch.where(valid[lidx, :, None], q_mem[lidx], q)
-            valid[lidx] |= True
-            return torch.cat([mixed_q, kv], -1) if fused else mixed_q
+                d = out.size(-1) // 3
+                q, kv = out[..., :d], out[..., d:]
+                # 首次 forward 时 q 尚未缓存，需要写入一次
+                new_mask = ~valid[lidx]
+                if new_mask.any():
+                    q_mem[lidx, new_mask] = q.squeeze(0)[new_mask]
+                    valid[lidx, new_mask] = True
+                # 之后步数直接替换为缓存
+                q = torch.where(valid[lidx, :, None], q_mem[lidx], q)
+                return torch.cat([q, kv], -1)
+            return out
+
         return pre_hook, post_hook
 
+    # ------------- 注册到所有层 ------------------------------
     for lidx, blk in enumerate(blocks):
-        if hasattr(blk, "q_proj"):
+        if hasattr(blk, "q_proj"):          # Q/K/V 分离
             pre, post = make_hooks(lidx, fused=False)
             blk.q_proj.register_forward_pre_hook(pre)
             blk.q_proj.register_forward_hook(post)
-        elif hasattr(blk, "att_proj"):
+        elif hasattr(blk, "att_proj"):      # QKV 融合
             _, post = make_hooks(lidx, fused=True)
             blk.att_proj.register_forward_hook(post)
-
-    def step_reset(mask_tensor):
-        decoded = (~mask_tensor.bool())[0]
-        valid[:, decoded] = False
-
-    return step_reset
 
 # ─────────────────────────────────── benchmark helper
 
@@ -223,16 +287,12 @@ def benchmark(prompt, tokenizer, *, steps, gen_len, block_len, use_qcache):
     with torch.inference_mode():
         _ = model(prompt[:, :1]); torch.cuda.synchronize()
 
-    step_reset = attach_qcache(model, prompt.shape[1] + gen_len) if use_qcache else None
-
-    def cb(_, mask):
-        if step_reset:
-            step_reset(mask)
+    attach_qcache_once(model, prompt.shape[1] + gen_len) if use_qcache else None
 
     with cuda_timer(f"{tag}") as get_elapsed:
-        out = generate_with_callback(model, prompt, steps=steps, gen_length=gen_len,
+        out = generate(model, prompt, steps=steps, gen_length=gen_len,
                                      block_length=block_len, temperature=0., cfg_scale=0.,
-                                     remasking='low_confidence', step_callback=cb)
+                                     remasking='low_confidence')
     # decode and show (outside timing)
     answer = tokenizer.batch_decode(out[:, prompt.shape[1]:], skip_special_tokens=True)[0]
     print(f"{tag} output → {answer}\n")
@@ -254,7 +314,7 @@ def main():
     prompt_txt = tokenizer.apply_chat_template([{"role": "user", "content": args.question}], add_generation_prompt=True, tokenize=False)
     prompt = torch.tensor(tokenizer(prompt_txt)["input_ids"], device=DEVICE).unsqueeze(0)
 
-    benchmark(prompt, tokenizer, steps=args.steps, gen_len=args.gen, block_len=args.block, use_qcache=False)
+    # benchmark(prompt, tokenizer, steps=args.steps, gen_len=args.gen, block_len=args.block, use_qcache=False)
     benchmark(prompt, tokenizer, steps=args.steps, gen_len=args.gen, block_len=args.block, use_qcache=True)
 
 if __name__ == "__main__":
