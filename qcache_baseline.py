@@ -15,6 +15,7 @@ from transformers import AutoTokenizer, AutoModel
 from generate import generate
 
 import types
+from torch.profiler import profile, record_function, ProfilerActivity
 
 # ───────────────────────────────────────── config
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -261,12 +262,14 @@ def benchmark(prompt, tokenizer, *, steps, gen_len, block_len, use_qcache):
 
     attach_qcache_monkey(model, prompt.shape[1] + gen_len) if use_qcache else None
     with cuda_timer(f"{tag}") as get_elapsed:
-        out = generate(model, prompt, steps=steps, gen_length=gen_len,
-                                     block_length=block_len, temperature=0., cfg_scale=0.,
-                                     remasking='low_confidence')
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            out = generate(model, prompt, steps=steps, gen_length=gen_len,
+                                         block_length=block_len, temperature=0., cfg_scale=0.,
+                                         remasking='low_confidence')
     # decode and show (outside timing)
     answer = tokenizer.batch_decode(out[:, prompt.shape[1]:], skip_special_tokens=True)[0]
     print(f"{tag} output → {answer}\n")
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
 
     # free memory
     del model; torch.cuda.empty_cache()
@@ -276,10 +279,10 @@ def benchmark(prompt, tokenizer, *, steps, gen_len, block_len, use_qcache):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--question", default="Explain diffusion models briefly.")
-    # ap.add_argument("--steps", type=int, default=128)
-    # ap.add_argument("--gen", type=int, default=128)
-    ap.add_argument("--steps", type=int, default=512)
-    ap.add_argument("--gen", type=int, default=512)
+    ap.add_argument("--steps", type=int, default=128)
+    ap.add_argument("--gen", type=int, default=128)
+    # ap.add_argument("--steps", type=int, default=512)
+    # ap.add_argument("--gen", type=int, default=512)
     ap.add_argument("--block", type=int, default=32)
     args = ap.parse_args()
 
