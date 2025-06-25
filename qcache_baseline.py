@@ -212,27 +212,37 @@ def find_blocks(model):
 #     return step_reset
 
 
-def attach_qcache_monkey(model, seq_len, device="cuda", dtype=torch.bfloat16):
-    blocks   = find_blocks(model)            # 你的辅助函数
+def attach_qcache_monkey(model, seq_len,
+                         device="cuda", dtype=torch.bfloat16):
+    blocks   = find_blocks(model)              # 你的辅助函数
     n_layers = len(blocks)
     d_model  = model.config.hidden_size
 
-    q_mem  = torch.empty(n_layers, seq_len, d_model, device=device, dtype=dtype)
-    cached = [False] * n_layers              # layer-level 标志
+    # 每层一次性缓存 (seq_len, d_model) 的 Query
+    q_mem  = torch.empty(n_layers, seq_len, d_model,
+                         device=device, dtype=dtype)
+    cached = [False] * n_layers                # layer-level flag
 
-    def patch_linear(lidx, lin: torch.nn.Linear):
-        orig_fwd = lin.forward               # 保存原实现
+    # ------------ 把 q_proj.forward 打补丁 ------------------------
+    def patch_linear(lidx: int, lin: torch.nn.Linear):
+        orig_fwd = lin.forward                # 保存原 BoundMethod
 
-        def new_forward(x):
-            if cached[lidx]:                 # 已缓存 → 直接返回
-                return q_mem[lidx:lidx+1]    # (1, L, d_q)
-            out = orig_fwd(x)                # 第一次正常 GEMM
-            q_mem[lidx] = out.squeeze(0).to(dtype)
+        def new_forward(self, x, *args, **kwargs):
+            # 若已缓存 ➜ 直接返回缓存张量，跳过 GEMM
+            if cached[lidx]:
+                # 扩 batch 维以适配 (B, L, d); 这里默认 B==1
+                return q_mem[lidx:lidx+1].to(x.dtype)
+
+            # 第一次调用 → 正常 GEMM
+            out = orig_fwd(x, *args, **kwargs)    # (1, L, d_q)
+            q_mem[lidx] = out[0].to(dtype)        # 仅支持 batch==1
             cached[lidx] = True
             return out
-        lin.forward = types.MethodType(new_forward, lin)  # monkey-patch
 
-    # 仅 patch 分离的 q_proj
+        # 用 types.MethodType 绑定到实例
+        lin.forward = types.MethodType(new_forward, lin)
+
+    # 只 patch 分离的 q_proj；模型里没有 att_proj，你已确认
     for lidx, blk in enumerate(blocks):
         if hasattr(blk, "q_proj"):
             patch_linear(lidx, blk.q_proj)
