@@ -12,10 +12,9 @@ import argparse
 from contextlib import contextmanager
 import torch
 from transformers import AutoTokenizer, AutoModel
-from generate import add_gumbel_noise, get_num_transfer_tokens, generate
+from generate import generate
 
-import numpy as np
-import torch.nn.functional as F
+import types
 
 # ───────────────────────────────────────── config
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -212,36 +211,32 @@ def find_blocks(model):
 #
 #     return step_reset
 
-def attach_qcache_once(model, seq_len, dtype=torch.bfloat16, device="cuda"):
-    blocks   = find_blocks(model)                       # 依旧沿用你的辅助函数
+
+def attach_qcache_monkey(model, seq_len, device="cuda", dtype=torch.bfloat16):
+    blocks   = find_blocks(model)            # 你的辅助函数
     n_layers = len(blocks)
     d_model  = model.config.hidden_size
 
-    # 每层一次性缓存整条序列的 Query
-    q_mem   = torch.empty(n_layers, seq_len, d_model,
-                          dtype=dtype, device=device)
-    cached  = [False] * n_layers        # layer-level flag
+    q_mem  = torch.empty(n_layers, seq_len, d_model, device=device, dtype=dtype)
+    cached = [False] * n_layers              # layer-level 标志
 
-    # ---------------- hook factory ---------------------------
-    def make_hooks(lidx: int):
-        # 若已缓存 → 直接返回缓存，Linear.forward 会被跳过
-        def pre_hook(mod, inp):
-            return (q_mem[lidx:lidx+1],) if cached[lidx] else None
+    def patch_linear(lidx, lin: torch.nn.Linear):
+        orig_fwd = lin.forward               # 保存原实现
 
-        # 第一次 forward 时写入缓存；随后不会再触发
-        def post_hook(mod, inp, out):
-            if not cached[lidx]:
-                q_mem[lidx] = out.squeeze(0)   # (seq_len, d_model)
-                cached[lidx] = True
-            return out    # 不改动首次输出；后续步 pre_hook 已接管
-        return pre_hook, post_hook
+        def new_forward(x):
+            if cached[lidx]:                 # 已缓存 → 直接返回
+                return q_mem[lidx:lidx+1]    # (1, L, d_q)
+            out = orig_fwd(x)                # 第一次正常 GEMM
+            q_mem[lidx] = out.squeeze(0).to(dtype)
+            cached[lidx] = True
+            return out
+        lin.forward = types.MethodType(new_forward, lin)  # monkey-patch
 
-    # 只需要处理分离的 q_proj
+    # 仅 patch 分离的 q_proj
     for lidx, blk in enumerate(blocks):
         if hasattr(blk, "q_proj"):
-            pre, post = make_hooks(lidx)
-            blk.q_proj.register_forward_pre_hook(pre)
-            blk.q_proj.register_forward_hook(post)
+            patch_linear(lidx, blk.q_proj)
+
 
 # ─────────────────────────────────── benchmark helper
 
@@ -254,8 +249,7 @@ def benchmark(prompt, tokenizer, *, steps, gen_len, block_len, use_qcache):
     with torch.inference_mode():
         _ = model(prompt[:, :1]); torch.cuda.synchronize()
 
-    attach_qcache_once(model, prompt.shape[1] + gen_len) if use_qcache else None
-
+    attach_qcache_monkey(model, prompt.shape[1] + gen_len) if use_qcache else None
     with cuda_timer(f"{tag}") as get_elapsed:
         out = generate(model, prompt, steps=steps, gen_length=gen_len,
                                      block_length=block_len, temperature=0., cfg_scale=0.,
