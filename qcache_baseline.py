@@ -212,67 +212,56 @@ def find_blocks(model):
 #
 #     return step_reset
 
-def attach_qcache_once(model, total_seq_len,
-                       dtype=torch.bfloat16, device="cuda"):
-    blocks   = find_blocks(model)              # 已有的辅助函数
+def attach_qcache_once(model, total_seq_len, dtype=torch.bfloat16, device="cuda"):
+    blocks   = find_blocks(model)                      # 你的辅助函数
     n_layers = len(blocks)
     d_model  = model.config.hidden_size
 
-    # 缓存与标志
+    # 缓存张量与有效位
     q_mem = torch.empty(n_layers, total_seq_len, d_model,
                         dtype=dtype, device=device)
     valid = torch.zeros(n_layers, total_seq_len, dtype=torch.bool,
                         device=device)
 
-    # ---------------- hook factory --------------------------------
+    # ------------ hook factory ------------------------------------
     def make_hooks(lidx: int, fused: bool):
-        # ---------- 前置钩子：真正跳过或稀疏 GEMM ----------
+
+        # pre-hook：若整层已缓存 ➜ 直接返回缓存、跳过 GEMM
         def pre_hook(module, inp):
-            if fused:                 # att_proj 无法单独省 Q
-                return None
-            x_in, = inp               # (1, L, d)
+            if fused:
+                return None                     # att_proj 仍需照常执行
+            if valid[lidx].all():               # 全部命中
+                return (q_mem[lidx:lidx+1],)    # PyTorch 会用它当作输出
+            return None                         # 否则正常 forward
 
-            # 哪些行还没算过 Q ?
-            need_mask = ~valid[lidx]          # True → 第一次
-            if not need_mask.any():           # 全都算过 → 完全跳过 GEMM
-                return (q_mem[lidx:lidx+1],)
-
-            # 稀疏 GEMM：仅算 need_mask 行
-            out = q_mem[lidx].clone()         # 先拷贝缓存
-            need = x_in[:, need_mask]         # (1, U, d)
-            proj = F.linear(need, module.weight, module.bias)  # (1, U, d_q)
-            out[need_mask] = proj.squeeze(0).to(dtype)
-
-            # 更新缓存与 valid
-            q_mem[lidx, need_mask] = out[need_mask]
-            valid[lidx, need_mask] = True
-
-            return (out.unsqueeze(0),)        # 作为整层输出
-
-        # ---------- 后置钩子：仅处理融合投影 ----------
+        # post-hook：第一次 forward 时把 Q 写入缓存
         def post_hook(module, inp, out):
             if fused:
                 d = out.size(-1) // 3
                 q, kv = out[..., :d], out[..., d:]
-                # 首次 forward 时 q 尚未缓存，需要写入一次
-                new_mask = ~valid[lidx]
-                if new_mask.any():
-                    q_mem[lidx, new_mask] = q.squeeze(0)[new_mask]
-                    valid[lidx, new_mask] = True
-                # 之后步数直接替换为缓存
-                q = torch.where(valid[lidx, :, None], q_mem[lidx], q)
-                return torch.cat([q, kv], -1)
-            return out
+            else:
+                q = out
+
+            # 找出第一次出现的 token 行（valid == False）
+            miss = ~valid[lidx]
+            if miss.any():
+                q_mem[lidx, miss] = q.squeeze(0)[miss]
+                valid[lidx, miss] = True
+
+            # 把已缓存行替换为缓存，确保数值一致
+            q_final = torch.where(valid[lidx, :, None], q_mem[lidx], q)
+
+            return torch.cat([q_final, kv], -1) if fused else q_final
 
         return pre_hook, post_hook
 
-    # ------------- 注册到所有层 ------------------------------
+    # ------------ 注册 hook 到所有层 -------------------------------
     for lidx, blk in enumerate(blocks):
-        if hasattr(blk, "q_proj"):          # Q/K/V 分离
+        if hasattr(blk, "q_proj"):              # Q/K/V 分离
             pre, post = make_hooks(lidx, fused=False)
             blk.q_proj.register_forward_pre_hook(pre)
             blk.q_proj.register_forward_hook(post)
-        elif hasattr(blk, "att_proj"):      # QKV 融合
+        elif hasattr(blk, "att_proj"):          # Q/K/V 融合
             _, post = make_hooks(lidx, fused=True)
             blk.att_proj.register_forward_hook(post)
 
