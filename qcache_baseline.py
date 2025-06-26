@@ -287,7 +287,8 @@ def benchmark(prompt, tokenizer, *, steps, gen_len, block_len, use_qcache):
     # decode and show (outside timing)
     answer = tokenizer.batch_decode(out[:, prompt.shape[1]:], skip_special_tokens=True)[0]
     print(f"{tag} output → {answer}\n")
-    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
+    # print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
+    print(prof.key_averages().table(row_limit=20))
 
     # free memory
     del model; torch.cuda.empty_cache()
