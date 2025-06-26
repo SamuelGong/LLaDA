@@ -143,7 +143,7 @@ def attach_qkv_full_cache(model, seq_len,
         lin.forward = types.MethodType(fwd, lin)
 
     # ---------------- Attention patch --------------
-    def patch_attn(lidx, attn_mod):
+    def patch_attn(lidx, blk):
         orig_attn = blk.attention  # 把整段 attention() 备份
         # 每层独享缓存 (只支持 B=1)
         blk._k_cache = None  # shape (n_kv_h, T, hs)
@@ -241,7 +241,7 @@ def attach_qkv_full_cache(model, seq_len,
         patch_kv(lidx, blk.k_proj, k_mem, k_valid)
         patch_kv(lidx, blk.v_proj, v_mem, v_valid)
         # Attention matmul
-        patch_attn(lidx, blk.attention)
+        patch_attn(lidx, blk)
 
     # ---------------- step_reset -------------------
     def step_reset(mask_tensor):
