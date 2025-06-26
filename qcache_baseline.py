@@ -130,6 +130,9 @@ def attach_qkv_full_cache(model, seq_len,
             need = ~valid[lidx]               # 哪些行要重算
             if not need.any():
                 return buf[lidx:lidx+1].to(x.dtype)
+
+            if lidx == 0:
+                print("layer", lidx, "recalc rows:", need.sum().item())
             out = buf[lidx].clone()           # (L,d)
             sub = x[:, need]                  # (1,U,d_model)
             proj = F.linear(sub, self.weight, self.bias)  # (1,U,d_k)
@@ -245,13 +248,13 @@ def attach_qkv_full_cache(model, seq_len,
         mask_tensor shape : (1, L)  True = still MASK
         将“刚解码”的行标记为 invalid，让下一步重算 K/V
         """
-        nonlocal prev_mask, k_valid, v_valid
-        still_mask = mask_tensor[0].bool()          # (L,)
-        decoded_now = (~still_mask) & prev_mask     # False→True 位置
+        nonlocal prev_mask, k_valid, v_valid  # prev_mask: bool (L,)
+        still_mask = mask_tensor[0].bool()  # True = 依旧 [MASK]
+        decoded_now = prev_mask & (~still_mask)  # 现在刚刚解码
         if decoded_now.any():
             k_valid[:, decoded_now] = False
             v_valid[:, decoded_now] = False
-        prev_mask = ~still_mask                     # 保存当前解码态
+        prev_mask = still_mask  # 更新「上一步」遮罩
     return step_reset
 
 
