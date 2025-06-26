@@ -149,6 +149,8 @@ def attach_qkv_full_cache(model, seq_len,
         blk._k_cache = None  # shape (n_kv_h, T, hs)
         blk._v_cache = None
         blk._logits = None  # shape (n_head, L, T)
+        blk._sum_exp = None  # (1, nh, L, 1)
+        blk._ctx = None  # (1, nh, L, hs)
 
         def fwd(self, q, k, v, attention_bias=None, layer_past=None, use_cache=False):
             """
@@ -206,13 +208,31 @@ def attach_qkv_full_cache(model, seq_len,
                     # 2.2 计算增量 QKᵀ  → (1, nh, L, U)
                     #    与官方一致:  先 matmul, 后乘 scale_factor
                     scale = 1.0 / math.sqrt(hs)
+
+                    # logits_new = torch.matmul(q, k_new.transpose(-1, -2)) * scale
+                    #
+                    # # 2.3 构造/更新 attn_bias 与 logits 缓存
+                    # if attention_bias is not None:
+                    #     logits_new = logits_new + attention_bias[..., new_mask]
+                    #
+                    # # 把新列写入 logits 缓存 (B==1 去掉 batch 维)
+                    # self._logits[..., new_mask] = logits_new.squeeze(0)
+
                     logits_new = torch.matmul(q, k_new.transpose(-1, -2)) * scale
-
-                    # 2.3 构造/更新 attn_bias 与 logits 缓存
                     if attention_bias is not None:
-                        logits_new = logits_new + attention_bias[..., new_mask]
+                        logits_new += attention_bias[..., new_mask]
 
-                    # 把新列写入 logits 缓存 (B==1 去掉 batch 维)
+                    exp_new = torch.exp(logits_new)  # (1, nh, L, U)
+                    if self._sum_exp is None:  # 第二步才有
+                        self._sum_exp = torch.sum(torch.exp(self._logits), dim=-1, keepdim=True)
+                        self._ctx = torch.matmul(
+                            torch.softmax(self._logits, dim=-1), self._v_cache)
+
+                    self._sum_exp = self._sum_exp + exp_new.sum(-1, keepdim=True)
+                    prob_new = exp_new / self._sum_exp  # (1, nh, L, U)
+                    self._ctx = self._ctx + torch.matmul(prob_new, v_new)
+
+                    # 拼列到 logits 缓存，用于下次增量
                     self._logits[..., new_mask] = logits_new.squeeze(0)
 
                 # (3) softmax + dropout （完整 L×T 矩阵，但已是缓存）
