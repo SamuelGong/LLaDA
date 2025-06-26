@@ -131,8 +131,8 @@ def attach_qkv_full_cache(model, seq_len,
             if not need.any():
                 return buf[lidx:lidx+1].to(x.dtype)
 
-            if lidx == 0:
-                print("layer", lidx, "recalc rows:", need.sum().item())
+            # if lidx == 0:
+            #     print("layer", lidx, "recalc rows:", need.sum().item())
             out = buf[lidx].clone()           # (L,d)
             sub = x[:, need]                  # (1,U,d_model)
             proj = F.linear(sub, self.weight, self.bias)  # (1,U,d_k)
