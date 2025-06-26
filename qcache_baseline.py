@@ -215,8 +215,7 @@ def attach_qkv_full_cache(model, seq_len,
                 ctx = self.attn_out(ctx)
                 return ctx, None
 
-
-        attn_mod.forward = types.MethodType(fwd, attn_mod)
+        blk.attention = types.MethodType(fwd, blk)
 
     # ---------------- 注册到模型 -------------------
     for lidx, blk in enumerate(blocks):
