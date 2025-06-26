@@ -267,16 +267,20 @@ def benchmark(prompt, tokenizer, *, steps, gen_len, block_len, use_qcache):
         _ = model(prompt[:, :1]); torch.cuda.synchronize()
 
     seq_len = prompt.shape[1] + gen_len
-    step_reset = attach_qkv_full_cache(model, seq_len)
+
+    if use_qcache:
+        step_reset = attach_qkv_full_cache(model, seq_len)
     # attach_qcache_monkey(model, prompt.shape[1] + gen_len) if use_qcache else None
     with cuda_timer(f"{tag}") as get_elapsed:
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            # out = generate(model, prompt, steps=steps, gen_length=gen_len,
-            #                              block_length=block_len, temperature=0., cfg_scale=0.,
-            #                              remasking='low_confidence')
-            out = generate_with_callback(model, prompt, steps=steps, gen_length=gen_len,
+            if use_qcache:
+                out = generate_with_callback(model, prompt, steps=steps, gen_length=gen_len,
                            block_length=block_len, temperature=0., cfg_scale=0.,
                            remasking='low_confidence', step_callback=lambda step, mask: step_reset(mask))
+            else:
+                out = generate(model, prompt, steps=steps, gen_length=gen_len,
+                               block_length=block_len, temperature=0., cfg_scale=0.,
+                               remasking='low_confidence')
     # decode and show (outside timing)
     answer = tokenizer.batch_decode(out[:, prompt.shape[1]:], skip_special_tokens=True)[0]
     print(f"{tag} output → {answer}\n")
