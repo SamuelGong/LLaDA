@@ -12,10 +12,11 @@ import argparse
 from contextlib import contextmanager
 import torch
 from transformers import AutoTokenizer, AutoModel
-from generate import generate
 
+from generate import generate, generate_with_callback
 import types
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import profile, ProfilerActivity
+import torch.nn.functional as F
 
 # ───────────────────────────────────────── config
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -32,127 +33,6 @@ def cuda_timer(label="Elapsed"):
     end.record(); torch.cuda.synchronize()
     print(f"{label}: {start.elapsed_time(end)/1000:.3f}s")
 
-# ───────────────────────────── generate with callback (same as before)
-# @torch.no_grad()
-# def generate_with_callback(model, prompt, *, steps=128, gen_length=128, block_length=128,
-#                            temperature=0., cfg_scale=0., remasking='low_confidence',
-#                            mask_id=126336, step_callback=None):
-#     x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long, device=model.device)
-#     x[:, :prompt.shape[1]] = prompt.clone()
-#     prompt_idx = (x != mask_id)
-#
-#     assert gen_length % block_length == 0
-#     n_blocks = gen_length // block_length
-#     assert steps % n_blocks == 0
-#     s_per_block = steps // n_blocks
-#
-#     for b in range(n_blocks):
-#         blk_slice = slice(prompt.shape[1] + b * block_length, prompt.shape[1] + (b + 1) * block_length)
-#         blk_mask = (x[:, blk_slice] == mask_id)
-#         n_trans = get_num_transfer_tokens(blk_mask, s_per_block)
-#
-#         for t in range(s_per_block):
-#             mask_idx = (x == mask_id)
-#             if cfg_scale > 0.:
-#                 un_x = x.clone(); un_x[prompt_idx] = mask_id
-#                 logits, un_logits = model(torch.cat([x, un_x], 0)).logits.chunk(2, 0)
-#                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-#             else:
-#                 logits = model(x).logits
-#
-#             logits = add_gumbel_noise(logits, temperature)
-#             x0 = logits.argmax(-1)
-#
-#             if remasking == 'low_confidence':
-#                 p = torch.softmax(logits, -1)
-#                 x0_p = p.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
-#             elif remasking == 'random':
-#                 x0_p = torch.rand_like(x0, dtype=logits.dtype)
-#             else:
-#                 raise NotImplementedError
-#
-#             x0_p[:, prompt.shape[1] + (b + 1) * block_length:] = -float('inf')
-#             x0 = torch.where(mask_idx, x0, x)
-#             conf = torch.where(mask_idx, x0_p, -float('inf'))
-#             transfer = torch.zeros_like(x, dtype=torch.bool)
-#             for j in range(conf.size(0)):
-#                 _, idx = torch.topk(conf[j], k=n_trans[j, t])
-#                 transfer[j, idx] = True
-#             x[transfer] = x0[transfer]
-#
-            # if step_callback is not None:
-            #     step_callback(b * s_per_block + t, (x == mask_id))
-#     return x
-
-# @ torch.no_grad()
-# def generate_with_callback(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-#              cfg_scale=0., remasking='low_confidence', mask_id=126336, step_callback=None):
-#     '''
-#     Args:
-#         model: Mask predictor.
-#         prompt: A tensor of shape (1, L).
-#         steps: Sampling steps, less than or equal to gen_length.
-#         gen_length: Generated answer length.
-#         block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
-#         temperature: Categorical distribution sampling temperature.
-#         cfg_scale: Unsupervised classifier-free guidance scale.
-#         remasking: Remasking strategy. 'low_confidence' or 'random'.
-#         mask_id: The toke id of [MASK] is 126336.
-#     '''
-#     x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
-#     x[:, :prompt.shape[1]] = prompt.clone()
-#
-#     prompt_index = (x != mask_id)
-#
-#     assert gen_length % block_length == 0
-#     num_blocks = gen_length // block_length
-#
-#     assert steps % num_blocks == 0
-#     steps = steps // num_blocks
-#
-#     for num_block in range(num_blocks):
-#         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
-#         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
-#         for i in range(steps):
-#             mask_index = (x == mask_id)
-#             if cfg_scale > 0.:
-#                 un_x = x.clone()
-#                 un_x[prompt_index] = mask_id
-#                 x_ = torch.cat([x, un_x], dim=0)
-#                 logits = model(x_).logits
-#                 logits, un_logits = torch.chunk(logits, 2, dim=0)
-#                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-#             else:
-#                 logits = model(x).logits
-#
-#             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-#             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-#
-#             if remasking == 'low_confidence':
-#                 p = F.softmax(logits, dim=-1)
-#                 x0_p = torch.squeeze(
-#                     torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
-#             elif remasking == 'random':
-#                 x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
-#             else:
-#                 raise NotImplementedError(remasking)
-#
-#             x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
-#
-#             x0 = torch.where(mask_index, x0, x)
-#             confidence = torch.where(mask_index, x0_p, -np.inf)
-#
-#             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-#             for j in range(confidence.shape[0]):
-#                 _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
-#                 transfer_index[j, select_index] = True
-#             x[transfer_index] = x0[transfer_index]
-#
-#             if step_callback is not None:
-#                 step_callback(num_block * steps + i, (x == mask_id))
-#
-#     return x
-
 # ─────────────────────────────── find transformer blocks
 
 def find_blocks(model):
@@ -167,86 +47,200 @@ def find_blocks(model):
             return obj
     raise ValueError("Cannot locate transformer blocks in model")
 
-# ───────────────────────────────── attach Q‑cache (unchanged from last version)
 
-# def attach_qcache(model, total_seq_len):
-#     blocks = find_blocks(model)
+# def attach_qcache_monkey(model, seq_len,
+#                          device="cuda", dtype=torch.bfloat16):
+#     blocks   = find_blocks(model)              # 你的辅助函数
 #     n_layers = len(blocks)
-#     d_model = model.config.hidden_size
+#     d_model  = model.config.hidden_size
 #
-#     q_mem = torch.empty(n_layers, total_seq_len, d_model, dtype=DTYPE, device=DEVICE)
-#     valid = torch.zeros(n_layers, total_seq_len, dtype=torch.bool, device=DEVICE)
+#     # 每层一次性缓存 (seq_len, d_model) 的 Query
+#     q_mem  = torch.empty(n_layers, seq_len, d_model,
+#                          device=device, dtype=dtype)
+#     cached = [False] * n_layers                # layer-level flag
 #
-#     def make_hooks(lidx, fused):
-#         def pre_hook(module, input):
-#             if fused:
-#                 return None
-#             if valid[lidx].all():
-#                 return (q_mem[lidx:lidx + 1],)
-#             return None
+#     # ------------ 把 q_proj.forward 打补丁 ------------------------
+#     def patch_linear(lidx: int, lin: torch.nn.Linear):
+#         orig_fwd = lin.forward                # 保存原 BoundMethod
 #
-#         def post_hook(module, input, output):
-#             if fused:
-#                 d = output.size(-1) // 3
-#                 q, kv = output[..., :d], output[..., d:]
-#             else:
-#                 q = output
-#             mixed_q = torch.where(valid[lidx, :, None], q_mem[lidx], q)
-#             q_mem[lidx] = torch.where(valid[lidx, :, None], q_mem[lidx], q)
-#             valid[lidx] |= True
-#             return torch.cat([mixed_q, kv], -1) if fused else mixed_q
-#         return pre_hook, post_hook
+#         def new_forward(self, x, *args, **kwargs):
+#             # 若已缓存 ➜ 直接返回缓存张量，跳过 GEMM
+#             if cached[lidx]:
+#                 # 扩 batch 维以适配 (B, L, d); 这里默认 B==1
+#                 return q_mem[lidx:lidx+1].to(x.dtype)
 #
+#             # 第一次调用 → 正常 GEMM
+#             out = orig_fwd(x, *args, **kwargs)    # (1, L, d_q)
+#             q_mem[lidx] = out[0].to(dtype)        # 仅支持 batch==1
+#             cached[lidx] = True
+#             return out
+#
+#         # 用 types.MethodType 绑定到实例
+#         lin.forward = types.MethodType(new_forward, lin)
+#
+#     # 只 patch 分离的 q_proj；模型里没有 att_proj，你已确认
 #     for lidx, blk in enumerate(blocks):
 #         if hasattr(blk, "q_proj"):
-#             pre, post = make_hooks(lidx, fused=False)
-#             blk.q_proj.register_forward_pre_hook(pre)
-#             blk.q_proj.register_forward_hook(post)
-#         elif hasattr(blk, "att_proj"):
-#             _, post = make_hooks(lidx, fused=True)
-#             blk.att_proj.register_forward_hook(post)
-#
-#     def step_reset(mask_tensor):
-#         decoded = (~mask_tensor.bool())[0]
-#         valid[:, decoded] = False
-#
-#     return step_reset
+#             patch_linear(lidx, blk.q_proj)
 
 
-def attach_qcache_monkey(model, seq_len,
-                         device="cuda", dtype=torch.bfloat16):
-    blocks   = find_blocks(model)              # 你的辅助函数
-    n_layers = len(blocks)
-    d_model  = model.config.hidden_size
+def attach_qkv_full_cache(model, seq_len,
+                          device="cuda", dtype=torch.bfloat16):
+    """
+    • Q : 首步算，后续整层复用
+    • K/V: 逐行稀疏重算 —— 只有在“刚解码”的位置重算一次
+    • Attention: 只对新增列做 QKᵀ、softmax、AV
+    返回 step_reset(mask) 供采样循环在每步调用
+    """
+    blocks     = find_blocks(model)                 # 你已有的工具
+    n_layers   = len(blocks)
+    d_model    = model.config.hidden_size
+    n_heads    = model.config.num_attention_heads
+    d_head     = d_model // n_heads
 
-    # 每层一次性缓存 (seq_len, d_model) 的 Query
-    q_mem  = torch.empty(n_layers, seq_len, d_model,
-                         device=device, dtype=dtype)
-    cached = [False] * n_layers                # layer-level flag
+    # ---------------- 缓存区 ------------------------
+    q_mem = torch.empty(n_layers, seq_len, d_model, device=device, dtype=dtype)
+    k_mem = torch.empty_like(q_mem)
+    v_mem = torch.empty_like(q_mem)
 
-    # ------------ 把 q_proj.forward 打补丁 ------------------------
-    def patch_linear(lidx: int, lin: torch.nn.Linear):
-        orig_fwd = lin.forward                # 保存原 BoundMethod
+    q_cached      = [False]*n_layers
+    k_valid = torch.zeros(n_layers, seq_len, dtype=torch.bool, device=device)
+    v_valid = torch.zeros_like(k_valid)
 
-        def new_forward(self, x, *args, **kwargs):
-            # 若已缓存 ➜ 直接返回缓存张量，跳过 GEMM
-            if cached[lidx]:
-                # 扩 batch 维以适配 (B, L, d); 这里默认 B==1
+    # 用于检测“新解码”位置
+    prev_mask = torch.ones(seq_len, dtype=torch.bool, device=device)  # True = still MASK
+
+    # ---------------- Q-proj patch ------------------
+    def patch_q(lidx, lin):
+        orig = lin.forward
+        def fwd(self, x, *a, **kw):
+            if q_cached[lidx]:
                 return q_mem[lidx:lidx+1].to(x.dtype)
-
-            # 第一次调用 → 正常 GEMM
-            out = orig_fwd(x, *args, **kwargs)    # (1, L, d_q)
-            q_mem[lidx] = out[0].to(dtype)        # 仅支持 batch==1
-            cached[lidx] = True
+            out = orig(x, *a, **kw)           # (1,L,d_q)
+            q_mem[lidx] = out[0].to(dtype)
+            q_cached[lidx] = True
             return out
+        lin.forward = types.MethodType(fwd, lin)
 
-        # 用 types.MethodType 绑定到实例
-        lin.forward = types.MethodType(new_forward, lin)
+    # ---------------- K/V-proj patch ----------------
+    def patch_kv(lidx, lin, buf, valid):
+        orig = lin.forward
+        def fwd(self, x, *a, **kw):
+            need = ~valid[lidx]               # 哪些行要重算
+            if not need.any():
+                return buf[lidx:lidx+1].to(x.dtype)
+            out = buf[lidx].clone()           # (L,d)
+            sub = x[:, need]                  # (1,U,d_model)
+            proj = F.linear(sub, self.weight, self.bias)  # (1,U,d_k)
+            out[need] = proj[0].to(dtype)
+            buf[lidx, need]  = out[need]
+            valid[lidx, need]= True
+            return out.unsqueeze(0).to(x.dtype)
+        lin.forward = types.MethodType(fwd, lin)
 
-    # 只 patch 分离的 q_proj；模型里没有 att_proj，你已确认
+    # ---------------- Attention patch --------------
+    def patch_attn(lidx, attn_mod):
+        orig_attn = blk.attention  # 把整段 attention() 备份
+        # 每层独享缓存 (只支持 B=1)
+        blk._k_cache = None  # shape (n_kv_h, T, hs)
+        blk._v_cache = None
+        blk._logits = None  # shape (n_head, L, T)
+
+        def fwd(self, q, k, v, attention_bias=None, layer_past=None, use_cache=False):
+            """
+            q_raw, k_raw, v_raw 形状均为 (1, L, d_model)
+            """
+            if layer_past is not None or use_cache:
+                raise NotImplementedError
+
+            B, L, C = q.size()
+            nh = self.config.n_heads
+            nkv = self.config.effective_n_kv_heads
+            hs = C // nh
+
+            # ------------ 首步：直接调用原 attention() ------------
+            if self._k_cache is None:
+                ctx, _ = orig_attn(q, k, v,
+                                   attention_bias, None, False)
+
+                # ==== 构造本层缓存，用于后续增量 ====
+                # 1) reshape / transpose
+                q = q.view(B, L, nh, hs).transpose(1, 2)  # (1, nh, L, hs)
+                k = k.view(B, L, nkv, hs).transpose(1, 2)  # (1, nkv, L, hs)
+                v = v.view(B, L, nkv, hs).transpose(1, 2)  # (1, nkv, L, hs)
+
+                # 2) Rotary（必须和首步内部一致）
+                if self.config.rope:
+                    q, k = self.rotary_emb(q, k)
+
+                # 3) 缓存
+                self._k_cache = k.clone()  # (1, nkv, L, hs)
+                self._v_cache = v.clone()
+                self._logits = torch.matmul(q, k.transpose(-1, -2))  # (1, nh, L, L)
+
+                return ctx, None  # 输出首步 ctx
+
+            # ----------- 后续步：只增量更新新列 -------------
+            else:
+                # —— reshape / transpose（与首步一致） ——
+                q = q.view(B, L, nh, hs).transpose(1, 2)  # (1, nh, L, hs)
+                k = k.view(B, L, nkv, hs).transpose(1, 2)  # (1, nkv, L, hs)
+                v = v.view(B, L, nkv, hs).transpose(1, 2)  # (1, nkv, L, hs)
+                if self.config.rope:
+                    q, k = self.rotary_emb(q, k)
+
+                # ——找出“本步刚解码”的列（由前面的 k_valid 写成 attr）——
+                new_mask = (~blk.k_valid[lidx]).squeeze(0)  # (L,)
+                if new_mask.any():
+                    # 取出新列
+                    k_new = k[:, :, new_mask]  # (1, nkv, U, hs)
+                    v_new = v[:, :, new_mask]
+                    # 写入列缓存
+                    self._k_cache[:, :, new_mask] = k_new
+                    self._v_cache[:, :, new_mask] = v_new
+                    # 计算增量 logits  (1, nh, L, U)
+                    logits_new = torch.matmul(q, k_new.transpose(-1, -2))
+                    self._logits[..., new_mask] = logits_new  # 拼列
+
+                # ——softmax & AV——
+                logits = self._logits / (hs ** 0.5)  # (1, nh, L, T)
+                if attention_bias is not None:
+                    logits = logits + attention_bias
+
+                attn_prob = torch.softmax(logits, dim=-1)  # (1, nh, L, T)
+                ctx_heads = torch.matmul(attn_prob, self._v_cache)  # (1, nh, L, hs)
+
+                # 合并 heads
+                ctx = ctx_heads.transpose(1, 2).contiguous().view(1, L, C)
+                ctx = self.attn_out(ctx)
+                return ctx, None
+
+
+        attn_mod.forward = types.MethodType(fwd, attn_mod)
+
+    # ---------------- 注册到模型 -------------------
     for lidx, blk in enumerate(blocks):
-        if hasattr(blk, "q_proj"):
-            patch_linear(lidx, blk.q_proj)
+        # Q / K / V
+        patch_q (lidx, blk.q_proj)
+        patch_kv(lidx, blk.k_proj, k_mem, k_valid)
+        patch_kv(lidx, blk.v_proj, v_mem, v_valid)
+        # Attention matmul
+        patch_attn(lidx, blk.attention)
+
+    # ---------------- step_reset -------------------
+    def step_reset(mask_tensor):
+        """
+        mask_tensor shape : (1, L)  True = still MASK
+        将“刚解码”的行标记为 invalid，让下一步重算 K/V
+        """
+        nonlocal prev_mask, k_valid, v_valid
+        still_mask = mask_tensor[0].bool()          # (L,)
+        decoded_now = (~still_mask) & prev_mask     # False→True 位置
+        if decoded_now.any():
+            k_valid[:, decoded_now] = False
+            v_valid[:, decoded_now] = False
+        prev_mask = ~still_mask                     # 保存当前解码态
+    return step_reset
 
 
 # ─────────────────────────────────── benchmark helper
@@ -260,12 +254,17 @@ def benchmark(prompt, tokenizer, *, steps, gen_len, block_len, use_qcache):
     with torch.inference_mode():
         _ = model(prompt[:, :1]); torch.cuda.synchronize()
 
-    attach_qcache_monkey(model, prompt.shape[1] + gen_len) if use_qcache else None
+    seq_len = prompt.shape[1] + gen_len
+    step_reset = attach_qkv_full_cache(model, seq_len)
+    # attach_qcache_monkey(model, prompt.shape[1] + gen_len) if use_qcache else None
     with cuda_timer(f"{tag}") as get_elapsed:
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            out = generate(model, prompt, steps=steps, gen_length=gen_len,
-                                         block_length=block_len, temperature=0., cfg_scale=0.,
-                                         remasking='low_confidence')
+            # out = generate(model, prompt, steps=steps, gen_length=gen_len,
+            #                              block_length=block_len, temperature=0., cfg_scale=0.,
+            #                              remasking='low_confidence')
+            out = generate_with_callback(model, prompt, steps=steps, gen_length=gen_len,
+                           block_length=block_len, temperature=0., cfg_scale=0.,
+                           remasking='low_confidence', step_callback=lambda step, mask: step_reset(mask))
     # decode and show (outside timing)
     answer = tokenizer.batch_decode(out[:, prompt.shape[1]:], skip_special_tokens=True)[0]
     print(f"{tag} output → {answer}\n")
