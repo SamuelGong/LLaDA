@@ -190,7 +190,7 @@ def attach_qkv_full_cache(model, seq_len,
                     q, k = self.rotary_emb(q, k)
 
                 # ——找出“本步刚解码”的列（由前面的 k_valid 写成 attr）——
-                new_mask = (~blk.k_valid[lidx]).squeeze(0)  # (L,)
+                new_mask = (~k_valid[lidx]).squeeze(0)  # (L,)
                 if new_mask.any():
                     # 取出新列
                     k_new = k[:, :, new_mask]  # (1, nkv, U, hs)
