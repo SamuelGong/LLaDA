@@ -200,53 +200,34 @@ def attach_qkv_full_cache(model, seq_len,
                 if new_mask.any():
                     k_new = k[:, :, new_mask]  # (1, nkv, U, hs)
                     v_new = v[:, :, new_mask]
-
-                    # 2.1 追加到列缓存
                     self._k_cache[:, :, new_mask] = k_new
                     self._v_cache[:, :, new_mask] = v_new
 
-                    # 2.2 计算增量 QKᵀ  → (1, nh, L, U)
-                    #    与官方一致:  先 matmul, 后乘 scale_factor
                     scale = 1.0 / math.sqrt(hs)
-
-                    # logits_new = torch.matmul(q, k_new.transpose(-1, -2)) * scale
-                    #
-                    # # 2.3 构造/更新 attn_bias 与 logits 缓存
-                    # if attention_bias is not None:
-                    #     logits_new = logits_new + attention_bias[..., new_mask]
-                    #
-                    # # 把新列写入 logits 缓存 (B==1 去掉 batch 维)
-                    # self._logits[..., new_mask] = logits_new.squeeze(0)
-
                     logits_new = torch.matmul(q, k_new.transpose(-1, -2)) * scale
                     if attention_bias is not None:
                         logits_new += attention_bias[..., new_mask]
-
                     exp_new = torch.exp(logits_new)  # (1, nh, L, U)
-                    if self._sum_exp is None:  # 第二步才有
-                        self._sum_exp = torch.sum(torch.exp(self._logits), dim=-1, keepdim=True)
-                        self._ctx = torch.matmul(
-                            torch.softmax(self._logits, dim=-1), self._v_cache)
 
+                    # ---------- ③ 初始化全局 sum_exp & ctx （只执行一次） ----------
+                    if self._sum_exp is None:
+                        logits_full = self._logits * (1.0 / math.sqrt(hs))
+                        if attention_bias is not None:
+                            logits_full = logits_full + attention_bias
+                        exp_full = torch.exp(logits_full)  # (1,nh,L,L)
+                        self._sum_exp = exp_full.sum(-1, keepdim=True)  # (1,nh,L,1)
+                        self._ctx = torch.matmul(  # (1,nh,L,hs)
+                            exp_full / self._sum_exp, self._v_cache)
+
+                    # ---------- ④ 增量归一化 + ctx 累积 ----------
                     self._sum_exp = self._sum_exp + exp_new.sum(-1, keepdim=True)
-                    prob_new = exp_new / self._sum_exp  # (1, nh, L, U)
+                    prob_new = exp_new / self._sum_exp  # (1,nh,L,U)
                     self._ctx = self._ctx + torch.matmul(prob_new, v_new)
 
-                    # 拼列到 logits 缓存，用于下次增量
-                    self._logits[..., new_mask] = logits_new.squeeze(0)
-
-                # (3) softmax + dropout （完整 L×T 矩阵，但已是缓存）
-                attn_weight = torch.softmax(self._logits, dim=-1)  # (1, nh, L, T)
-                if self.training and self.config.attention_dropout > 0.0:
-                    attn_weight = torch.dropout(attn_weight,
-                                                self.config.attention_dropout,
-                                                True)
-
-                # (4) attention_weight @ V  —— 只用缓存 V
-                ctx_heads = torch.matmul(attn_weight,
-                                         self._v_cache)  # (1, nh, L, hs)
+                    self._logits[..., new_mask] = logits_new.squeeze(0)  # 更新列
 
                 # (5) 合并头并做输出投影
+                ctx_heads = self._ctx  # (1,nh,L,hs)
                 ctx = ctx_heads.transpose(1, 2).contiguous().view(1, L, C)
                 ctx = self.attn_out(ctx)
                 return ctx, None
